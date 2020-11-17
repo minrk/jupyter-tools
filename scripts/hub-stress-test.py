@@ -2,6 +2,7 @@
 
 import argparse
 from concurrent import futures
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 import functools
 import json
@@ -113,15 +114,28 @@ without actually making any changes, for example:
                                help='Number of users/servers (pods) to create '
                                     '(default: 100).')
 
-    subparsers = parser.add_subparsers(dest='command', required=True)
-    stress_parser = subparsers.add_parser(
-        'stress-test', parents=[parent_parser]
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    stress_parser = subparsers.add_parser("stress-test", parents=[parent_parser])
+    parent_parser.add_argument(
+        "-b",
+        "--batch-size",
+        default=10,
+        type=int,
+        help="Batch size to use when creating users and notebook servers. "
+        "Note that by default z2jh will limit concurrent server creation "
+        "to 64 (see c.JupyterHub.concurrent_spawn_limit) (default: 10). ",
     )
-    stress_parser.add_argument(
-        '-b', '--batch-size', default=10, type=int,
-        help='Batch size to use when creating users and notebook servers. '
-             'Note that by default z2jh will limit concurrent server creation '
-             'to 64 (see c.JupyterHub.concurrent_spawn_limit) (default: 10). '
+
+    user_stress_parser = subparsers.add_parser(
+        "user-stress-test", parents=[parent_parser]
+    )
+
+    user_stress_parser.add_argument(
+        "-t",
+        "--total-count",
+        default=10,
+        type=int,
+        help="Total number of users to create",
     )
 
     activity_parser = subparsers.add_parser(
@@ -177,7 +191,7 @@ def setup_logging(verbose=False, log_to_file=False, args=None):
         # Scrub the token though so we don't log it.
         args_dict = dict(vars(args))  # Make sure to copy the vars dict.
         args_dict['token'] = '***'
-        LOG.info('Args: %s', args_dict)
+        LOG.info("Args: %s", json.dumps(args_dict, sort_keys=True))
 
     def log_uncaught_exceptions(exc_type, exc_value, exc_traceback):
         root_logger.critical("Uncaught exception",
@@ -186,15 +200,24 @@ def setup_logging(verbose=False, log_to_file=False, args=None):
     sys.excepthook = log_uncaught_exceptions
 
 
+@contextmanager
+def timer(message):
+    """Context manager for measuring time"""
+    start_time = time.perf_counter()
+    try:
+        yield
+    finally:
+        stop_time = time.perf_counter()
+        LOG.info(f"Took {stop_time - start_time:.3f} seconds to {message}")
+
+
 def timeit(f):
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
-        start_time = time.time()
-        try:
+        start_time = time.perf_counter()
+        with timer(f.__name__):
             return f(*args, **kwargs)
-        finally:
-            LOG.info('Took %.3f seconds to %s',
-                     (time.time() - start_time), f.__name__)
+
     return wrapper
 
 
@@ -265,8 +288,9 @@ def wait_for_server_to_stop(username, endpoint, session):
 
 
 def stop_server(username, endpoint, session, wait=False):
-    resp = session.delete(endpoint + '/users/%s/server' % username,
-                          timeout=DEFAULT_TIMEOUT)
+    resp = session.delete(
+        endpoint + "/users/%s/server" % username, timeout=DEFAULT_TIMEOUT
+    )
     if resp:
         # If we got a 204 then the server is stopped and we should not
         # need to poll.
@@ -293,8 +317,9 @@ def stop_servers(usernames, endpoint, session, batch_size):
     # `slow_stop_timeout` default of 10 seconds in the hub API can cause the
     # stop action to be somewhat synchronous.
     with futures.ThreadPoolExecutor(
-            max_workers=batch_size,
-            thread_name_prefix='hub-stress-test:stop_servers') as executor:
+        max_workers=max(batch_size, 1),
+        thread_name_prefix="hub-stress-test:stop_servers",
+    ) as executor:
         future_to_username = {
             executor.submit(stop_server, username, endpoint, session): username
             for username in usernames
@@ -406,8 +431,16 @@ def create_users(count, batch_size, endpoint, session, existing_users=[]):
 
 
 def start_server(username, endpoint, session):
-    resp = session.post(endpoint + '/users/%s/server' % username,
-                        timeout=DEFAULT_TIMEOUT)
+    resp = session.get(
+        endpoint + "/users/%s" % username, timeout=DEFAULT_TIMEOUT
+    )
+    user_info = resp.json()
+    if user_info["servers"].get(""):
+        LOG.debug("Server for user %s is already running", username)
+        return
+    resp = session.post(
+        endpoint + "/users/%s/server" % username, timeout=DEFAULT_TIMEOUT
+    )
     if resp:
         LOG.debug('Server for user %s is starting', username)
     else:
@@ -419,8 +452,10 @@ def start_server(username, endpoint, session):
 
 @timeit
 def start_servers(users, endpoint, session):
-    LOG.info('Starting notebook servers')
+    LOG.info(f"Starting {sum(len(usernames) for usernames in users)} notebook servers")
     for index, usernames in enumerate(users):
+        if not usernames:
+            continue
         # Start the servers in batches using a ThreadPoolExecutor because
         # the start operation is not totally asynchronous so we should be able
         # to speed this up by doing the starts concurrently. That will also be
@@ -435,7 +470,9 @@ def start_servers(users, endpoint, session):
 
 @timeit
 def wait_for_servers_to_start(users, endpoint, session):
-    LOG.info('Waiting for notebook servers to be ready')
+    LOG.info(
+        f"Waiting for {sum(len(usernames) for usernames in users)} notebook servers to be ready"
+    )
     # Rather than do a GET for each individual user/server, we could get all
     # users and then filter out any that aren't in our list. However, there
     # could be servers in that list that are ready (the ones created first) and
@@ -480,7 +517,7 @@ def wait_for_servers_to_start(users, endpoint, session):
 
 
 @timeit
-def find_existing_stress_test_users(endpoint, session):
+def find_existing_stress_test_users(endpoint, session, state=None):
     """Finds all existing hub-stress-test users.
 
     :param endpoint: base endpoint URL
@@ -488,15 +525,18 @@ def find_existing_stress_test_users(endpoint, session):
     :returns: list of existing hub-stress-test users
     """
     # This could be a lot of users so make the timeout conservative.
-    resp = session.get(endpoint + '/users', timeout=120)
+    url = endpoint + "/users"
+    if state:
+        url += f"?state={state}"
+    resp = session.get(url, timeout=120)
     if resp:
         users = resp.json()
-        LOG.debug('Found %d existing users in the hub', len(users))
+        LOG.debug("Found %d existing users in the hub", len(users))
         if users:
             users = list(
-                filter(lambda user: user['name'].startswith(USERNAME_PREFIX),
-                       users))
-            LOG.debug('Found %d existing hub-stress-test users', len(users))
+                filter(lambda user: user["name"].startswith(USERNAME_PREFIX), users)
+            )
+            LOG.debug("Found %d existing hub-stress-test users", len(users))
         return users
     else:
         # If the token is bad then we want to bail.
@@ -507,8 +547,7 @@ def find_existing_stress_test_users(endpoint, session):
 
 
 @timeit
-def run_stress_test(count, batch_size, token, endpoint, dry_run=False,
-                    keep=False):
+def run_stress_test(count, batch_size, token, endpoint, dry_run=False, keep=False):
     session = get_session(token, dry_run=dry_run)
     if batch_size > count:
         batch_size = count
@@ -516,8 +555,9 @@ def run_stress_test(count, batch_size, token, endpoint, dry_run=False,
     # that will determine our starting index for names.
     existing_users = find_existing_stress_test_users(endpoint, session)
     # Create the users in batches.
-    users = create_users(count, batch_size, endpoint, session,
-                         existing_users=existing_users)
+    users = create_users(
+        count, batch_size, endpoint, session, existing_users=existing_users
+    )
     # Now that we've created the users, start a server for each in batches.
     start_servers(users, endpoint, session)
     # Now that all servers are starting we need to poll until they are ready.
@@ -532,6 +572,88 @@ def run_stress_test(count, batch_size, token, endpoint, dry_run=False,
         LOG.info('Deleting %d users', len(usernames))
         if not delete_users(usernames, endpoint, session, batch_size):
             raise Exception('Failed to delete all users')
+
+
+@timeit
+def run_user_list_test(
+    total_count, active_count, batch_size, token, endpoint, dry_run=False, keep=False
+):
+    session = get_session(token, dry_run=dry_run)
+    if active_count > total_count:
+        active_count = total_count
+    if batch_size > active_count:
+        batch_size = active_count
+    batch_size = max(batch_size, 1)
+    # First figure out how many existing hub-stress-test users there are since
+    # that will determine our starting index for names.
+    existing_users = find_existing_stress_test_users(endpoint, session)
+    # Create the users in batches.
+    new_user_count = max(total_count - len(existing_users), 0)
+    LOG.info(f"Have {len(existing_users)}/{total_count}, creating {new_user_count} more")
+    
+    # collect existing users into batches,
+    # as if they were created by create_users
+    users = []
+    batch = []
+    for user in existing_users:
+        batch.append(user["name"])
+        if len(batch) == batch_size:
+            users.append(batch)
+            batch = []
+    if batch:
+        users.append(batch)
+
+    if new_user_count:
+        new_users = create_users(
+            new_user_count, batch_size, endpoint, session, existing_users=existing_users
+        )
+        users.extend(new_users)
+
+    # Now that we've created the users, start a server for each in batches.
+    active_remaining = active_count
+    active_users = []
+    for user_batch in users:
+        user_batch = user_batch[:active_remaining]
+        active_users.append(user_batch)
+        active_remaining -= len(user_batch)
+        if active_remaining <= 0:
+            break
+
+    start_servers(active_users, endpoint, session)
+    LOG.info("start done")
+    # Now that all servers are starting we need to poll until they are ready.
+    # Note that because of the concurrent_spawn_limit in the hub we could be
+    # waiting awhile. We could also be waiting in case the auto-scaler needs to
+    # add more nodes.
+    wait_for_servers_to_start(active_users, endpoint, session)
+    # If we don't need to keep the users/servers then remove them.
+
+    with timer("find all users"):
+        all_users = find_existing_stress_test_users(endpoint, session)
+    LOG.info(f"Found {len(all_users)} total users")
+
+    with timer("find active users"):
+        active_users = find_existing_stress_test_users(
+            endpoint, session, state="active"
+        )
+    LOG.info(f"Found {len(active_users)} active users")
+
+    with timer("find inactive users"):
+        inactive_users = find_existing_stress_test_users(
+            endpoint, session, state="inactive"
+        )
+    LOG.info(f"Found {len(inactive_users)} inactive users")
+
+    with timer("find ready users"):
+        ready_users = find_existing_stress_test_users(endpoint, session, state="ready")
+    LOG.info(f"Found {len(ready_users)} ready users")
+
+    if not keep:
+        # Flatten the list of lists so we delete all users in a single run.
+        usernames = [username for usernames in users for username in usernames]
+        LOG.info("Deleting %d users", len(usernames))
+        if not delete_users(usernames, endpoint, session, batch_size):
+            raise Exception("Failed to delete all users")
 
 
 @timeit
@@ -604,8 +726,12 @@ def notebook_activity_test(count, token, endpoint, workers, keep=False,
             LOG.debug("[ping-hub] Fetching user model took %f seconds", total)
 
         avg = sum(ping_times) / len(ping_times)
-        LOG.info("Hub ping time: average=%f, min=%f, max=%f",
-                 avg, min(ping_times), max(ping_times))
+        LOG.info(
+            "Hub ping time: average=%f, min=%f, max=%f",
+            avg,
+            min(ping_times),
+            max(ping_times),
+        )
 
     LOG.info("Simulating activity updates for %d users", count)
     times = []
@@ -652,14 +778,34 @@ def main():
     try:
         if args.command == 'purge':
             purge_users(args.token, args.endpoint, dry_run=args.dry_run)
-        elif args.command == 'stress-test':
-            run_stress_test(args.count, args.batch_size, args.token,
-                            args.endpoint, dry_run=args.dry_run,
-                            keep=args.keep)
-        elif args.command == 'activity-stress-test':
-            notebook_activity_test(args.count, args.token,
-                                   args.endpoint, args.workers, keep=args.keep,
-                                   dry_run=args.dry_run)
+        elif args.command == "stress-test":
+            run_stress_test(
+                args.count,
+                args.batch_size,
+                args.token,
+                args.endpoint,
+                dry_run=args.dry_run,
+                keep=args.keep,
+            )
+        elif args.command == "user-stress-test":
+            run_user_list_test(
+                args.total_count,
+                args.count,
+                args.batch_size,
+                args.token,
+                args.endpoint,
+                dry_run=args.dry_run,
+                keep=args.keep,
+            )
+        elif args.command == "activity-stress-test":
+            notebook_activity_test(
+                args.count,
+                args.token,
+                args.endpoint,
+                args.workers,
+                keep=args.keep,
+                dry_run=args.dry_run,
+            )
     except Exception as e:
         LOG.exception(e)
         sys.exit(128)
