@@ -102,6 +102,7 @@ without actually making any changes, for example:
 
     # This parser holds arguments that need to be shared among two or more
     # subcommands but should not be top-level arguments.
+    
     parent_parser = argparse.ArgumentParser(add_help=False)
     parent_parser.add_argument(
         '-k', '--keep', action='store_true',
@@ -581,8 +582,8 @@ def run_user_list_test(
     session = get_session(token, dry_run=dry_run)
     if active_count > total_count:
         active_count = total_count
-    if batch_size > active_count:
-        batch_size = active_count
+    if batch_size > total_count:
+        batch_size = total_count
     batch_size = max(batch_size, 1)
     # First figure out how many existing hub-stress-test users there are since
     # that will determine our starting index for names.
